@@ -24,6 +24,12 @@ impl Default for FitMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetFormat {
+    Avif,
+    Webp,
+}
+
 proxy_wasm::main! {{
     proxy_wasm::set_log_level(LogLevel::Trace);
     proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> { Box::new(HttpBodyRoot) });
@@ -106,18 +112,30 @@ impl HttpContext for HttpBody {
             }
         }
 
-        // Check if AVIF conversion is enabled
-        let convert_to_avif = match str_param("CONVERT_TO_AVIF") {
-            Ok(val) => val.to_lowercase() == "true" || val == "1",
-            Err(_) => true, // Default to true for backward compatibility
-        };
-        
-        // Set the target format based on environment variable
-        if convert_to_avif {
-            self.set_http_request_header("Image-Format", Some("image/avif"));
-        } else {
-            // Keep original format, but still indicate processing needed for resize
-            self.set_http_request_header("Image-Format", Some("original-with-processing"));
+        let convert_to_avif = bool_param("CONVERT_TO_AVIF", true);
+        let convert_to_webp = bool_param("CONVERT_TO_WEBP", false);
+        let accept_header = self.get_http_request_header("Accept");
+        let target_format = self.select_target_format(
+            convert_to_avif,
+            convert_to_webp,
+            accept_header.as_deref(),
+        );
+
+        match target_format {
+            Some(TargetFormat::Avif) => {
+                println!("Selected AVIF conversion");
+                self.set_http_request_header("Image-Format", Some("image/avif"));
+            }
+            Some(TargetFormat::Webp) => {
+                println!("Selected WebP conversion");
+                self.set_http_request_header("Image-Format", Some("image/webp"));
+            }
+            None => {
+                if resize_params.width.is_some() || resize_params.height.is_some() {
+                    println!("No format conversion selected; resizing original image");
+                    self.set_http_request_header("Image-Format", Some("original-with-processing"));
+                }
+            }
         }
 
         Action::Continue
@@ -140,10 +158,26 @@ impl HttpContext for HttpBody {
         let Some(content_type) = self.get_http_request_header("Image-Format") else {
             return Action::Continue;
         };
-        // instruct cache to vary by this header so "original" and "image/avif" are cached separately
         self.add_http_response_header("Vary", "Image-Format");
-        
-        // Add resize parameters to Vary header if present and set operations header
+
+        let mut operations: Vec<String> = Vec::new();
+        match content_type.as_str() {
+            "image/avif" => {
+                operations.push("convert:avif".to_string());
+            }
+            "image/webp" => {
+                operations.push("convert:webp".to_string());
+            }
+            "original-with-processing" => {}
+            "original" => {
+                return Action::Continue;
+            }
+            other => {
+                println!("Unsupported Image-Format header value: {}", other);
+                return Action::Continue;
+            }
+        }
+
         if self.get_http_request_header("Image-Resize").is_some() {
             self.add_http_response_header("Vary", "Image-Resize");
             
@@ -156,24 +190,26 @@ impl HttpContext for HttpBody {
                     (None, Some(h)) => format!("resize:*x{}", h),
                     _ => "resize".to_string(),
                 };
-                self.add_http_response_header("X-Img-Operations", &resize_info);
+                operations.push(resize_info);
             }
         }
 
-        if content_type == "original" {
-            return Action::Continue;
-        };
+        if !operations.is_empty() {
+            let operations_header = operations.join(",");
+            println!("X-Img-Operations header set to: {}", operations_header);
+            self.set_http_response_header("X-Img-Operations", Some(operations_header.as_str()));
+        }
 
-        // image to be transformed, set headers accordingly
         self.set_http_response_header("Content-Length", None);
         self.set_http_response_header("Transfer-Encoding", Some("Chunked"));
         
-        // Set content type based on whether we're converting to AVIF or keeping original
+        // Set content type based on whether we're converting to AVIF or WebP or keeping original
         if content_type == "image/avif" {
             self.set_http_response_header("Content-Type", Some("image/avif"));
+        } else if content_type == "image/webp" {
+            self.set_http_response_header("Content-Type", Some("image/webp"));
         } else if content_type == "original-with-processing" {
-            // Keep original content type, will be determined from the actual image
-            // Content-Type will be set in the response body phase
+            // Content-Type will be determined from the actual image in the body phase
         }
 
         // indicate to on_http_response_body that transformation is needed
@@ -200,9 +236,10 @@ impl HttpContext for HttpBody {
         };
 
         let convert_to_avif = content_type == "image/avif";
+        let convert_to_webp = content_type == "image/webp";
         let process_original = content_type == "original-with-processing";
         
-        if !convert_to_avif && !process_original {
+        if !convert_to_avif && !convert_to_webp && !process_original {
             println!("Content-Type {} is not supported, not transforming", content_type);
             return Action::Continue;
         }
@@ -245,6 +282,11 @@ impl HttpContext for HttpBody {
                         u8_param("AVIF_SPEED", 1, 10, 5),
                         u8_param("AVIF_QUALITY", 1, 100, 70))
                 )
+            } else if convert_to_webp {
+                println!("Starting WebP encoding...");
+                img.write_with_encoder(
+                    codecs::webp::WebPEncoder::new_lossless(&mut c)
+                )
             } else {
                 println!("Saving in original format...");
                 // Determine original format from the image and save accordingly
@@ -255,6 +297,8 @@ impl HttpContext for HttpBody {
                 Ok(_) => {
                     if convert_to_avif {
                         println!("AVIF encoding successful: {} bytes -> {} bytes", body_size, out.len());
+                    } else if convert_to_webp {
+                        println!("WebP encoding successful: {} bytes -> {} bytes", body_size, out.len());
                     } else {
                         println!("Original format processing successful: {} bytes -> {} bytes", body_size, out.len());
                         // Set the correct content-type for original format
@@ -283,6 +327,8 @@ impl HttpContext for HttpBody {
                 Err(e) => {
                     if convert_to_avif {
                         println!("AVIF encoding failed: {}", e);
+                    } else if convert_to_webp {
+                        println!("WebP encoding failed: {}", e);
                     } else {
                         println!("Original format processing failed: {}", e);
                     }
@@ -449,6 +495,66 @@ impl HttpBody {
             }
         }
     }
+
+    fn select_target_format(
+        &self,
+        convert_to_avif: bool,
+        convert_to_webp: bool,
+        accept_header: Option<&str>,
+    ) -> Option<TargetFormat> {
+        if !convert_to_avif && !convert_to_webp {
+            println!("All format conversions disabled via environment variables");
+            return None;
+        }
+
+        let accept_raw = accept_header.unwrap_or("");
+        if !accept_raw.is_empty() {
+            println!("Client Accept header: {}", accept_raw);
+        }
+
+        let accept = accept_raw.to_ascii_lowercase();
+        let supports_avif = accept_header_allows(&accept, "image/avif");
+        let supports_webp = accept_header_allows(&accept, "image/webp");
+        let accepts_any_image = accept_header_allows(&accept, "image/*") || accept_header_allows(&accept, "*/*");
+
+        if convert_to_avif && convert_to_webp {
+            if supports_avif {
+                return Some(TargetFormat::Avif);
+            }
+            if supports_webp {
+                return Some(TargetFormat::Webp);
+            }
+            if accepts_any_image || accept.is_empty() {
+                return Some(TargetFormat::Avif);
+            }
+            println!(
+                "Accept header does not permit AVIF or WebP; serving original image"
+            );
+            return None;
+        }
+
+        if convert_to_avif {
+            if supports_avif || accepts_any_image || accept.is_empty() {
+                return Some(TargetFormat::Avif);
+            }
+            println!(
+                "Accept header does not permit AVIF; serving original image"
+            );
+            return None;
+        }
+
+        if convert_to_webp {
+            if supports_webp || accepts_any_image || accept.is_empty() {
+                return Some(TargetFormat::Webp);
+            }
+            println!(
+                "Accept header does not permit WebP; serving original image"
+            );
+            return None;
+        }
+
+        None
+    }
 }
 
 fn str_param(name: &str) -> Result<String, VarError>
@@ -489,4 +595,43 @@ fn u8_param(name: &str, min: u8, max: u8, default: u8) -> u8
     }
 
     val
+}
+
+fn bool_param(name: &str, default: bool) -> bool
+{
+    match env::var(name) {
+        Ok(val) => {
+            if val.is_empty() {
+                println!(
+                    "Param {} is empty, using default value {}",
+                    name,
+                    default
+                );
+                return default;
+            }
+            match val.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                other => {
+                    println!(
+                        "Param {} has invalid boolean value '{}', using default {}",
+                        name,
+                        other,
+                        default
+                    );
+                    default
+                }
+            }
+        }
+        Err(_) => default,
+    }
+}
+
+fn accept_header_allows(accept: &str, needle: &str) -> bool
+{
+    accept.split(',').any(|segment| {
+        let trimmed = segment.trim();
+        let media_type = trimmed.split_once(';').map(|(m, _)| m.trim()).unwrap_or(trimmed);
+        media_type == needle
+    })
 }
