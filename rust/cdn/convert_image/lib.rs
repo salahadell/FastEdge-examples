@@ -193,6 +193,9 @@ impl HttpContext for HttpBody {
             println!("Image-Crop header set to: {}", cache_key);
         }
 
+        // Parse quality parameter (validated later when transformations are applied)
+        let requested_quality = self.parse_quality_param();
+
         // get extension
         let Some(ext)= self.get_property(vec!["request.extension"]) else {
             println!("No extension in request path, not transforming");
@@ -234,12 +237,16 @@ impl HttpContext for HttpBody {
         let convert_to_webp = bool_param("CONVERT_TO_WEBP", false);
         let requested_formats = self.parse_requested_formats();
         let accept_header = self.get_http_request_header("Accept");
+        let png_lossless = bool_param("PNG_LOSSLESS", true);
+
         let target_format = self.select_target_format(
             convert_to_avif,
             convert_to_webp,
             &requested_formats,
             accept_header.as_deref(),
         );
+
+        let conversion_selected = target_format.is_some();
 
         match target_format {
             Some(TargetFormat::Avif) => {
@@ -255,6 +262,27 @@ impl HttpContext for HttpBody {
                     println!("No format conversion selected; processing original image");
                     self.set_http_request_header("Image-Format", Some("original-with-processing"));
                 }
+            }
+        }
+
+        let env_quality = requested_quality.or_else(|| Self::env_quality_preset());
+        let transformations_requested = conversion_selected || resize_requested || crop_requested;
+        if let Some(q) = env_quality {
+            let applying_to_png = target_format.is_none() && ext.eq_ignore_ascii_case("png");
+            if png_lossless && applying_to_png {
+                println!(
+                    "Ignoring quality {} for PNG because PNG_LOSSLESS is enabled",
+                    q
+                );
+            } else if transformations_requested {
+                let value = q.to_string();
+                self.add_http_request_header("Image-Quality", &value);
+                println!("Image-Quality header set to: {}", value);
+            } else {
+                println!(
+                    "Quality parameter {} ignored because no other transformations are requested",
+                    q
+                );
             }
         }
 
@@ -279,6 +307,9 @@ impl HttpContext for HttpBody {
             return Action::Continue;
         };
         self.add_http_response_header("Vary", "Image-Format");
+
+        // Clear any cached quality information from previous requests
+        self.set_property(vec!["response.image-quality"], None);
 
         let mut operations: Vec<String> = Vec::new();
         match content_type.as_str() {
@@ -319,6 +350,12 @@ impl HttpContext for HttpBody {
             if let Some(crop) = self.parse_crop_params() {
                 operations.push(crop.operation_descriptor());
             }
+        }
+
+        if let Some(q) = self.get_http_request_header("Image-Quality") {
+            self.add_http_response_header("Vary", "Image-Quality");
+            operations.push(format!("quality:{}", q));
+            self.set_property(vec!["response.image-quality"], Some(q.as_bytes()));
         }
 
         if !operations.is_empty() {
@@ -365,6 +402,10 @@ impl HttpContext for HttpBody {
         let convert_to_avif = content_type == "image/avif";
         let convert_to_webp = content_type == "image/webp";
         let process_original = content_type == "original-with-processing";
+
+        let quality = self
+            .get_property(vec!["response.image-quality"])
+            .and_then(|bytes| from_utf8(&bytes).ok()?.parse::<u8>().ok());
         
         if !convert_to_avif && !convert_to_webp && !process_original {
             println!("Content-Type {} is not supported, not transforming", content_type);
@@ -430,17 +471,24 @@ impl HttpContext for HttpBody {
                     codecs::avif::AvifEncoder::new_with_speed_quality(
                         &mut c,
                         u8_param("AVIF_SPEED", 1, 10, 5),
-                        u8_param("AVIF_QUALITY", 1, 100, 70))
+                        match quality {
+                            Some(q) => q,
+                            None => u8_param("AVIF_QUALITY", 1, 100, 70),
+                        })
                 )
             } else if convert_to_webp {
-                println!("Starting WebP encoding...");
-                img.write_with_encoder(
-                    codecs::webp::WebPEncoder::new_lossless(&mut c)
-                )
+                if let Some(requested_quality) = quality {
+                    println!(
+                        "Ignoring quality={} for WebP because lossy encoding requires native libwebp support",
+                        requested_quality
+                    );
+                }
+                println!("Starting WebP encoding (lossless only)...");
+                img.write_with_encoder(codecs::webp::WebPEncoder::new_lossless(&mut c))
             } else {
                 println!("Saving in original format...");
                 // Determine original format from the image and save accordingly
-                self.save_in_original_format(&img, &mut out)
+                self.save_in_original_format(&img, &mut out, quality)
             };
 
             match res {
@@ -626,6 +674,78 @@ impl HttpBody {
         None
     }
 
+    fn parse_quality_param(&self) -> Option<u8> {
+        let query_bytes = self.get_property(vec!["request.query"])?;
+        let query = from_utf8(&query_bytes).ok()?;
+
+        for param in query.split('&') {
+            let mut parts = param.splitn(2, '=');
+            let key = parts.next()?.trim();
+            if key != "quality" {
+                continue;
+            }
+
+            let raw_value = parts.next().unwrap_or("").trim();
+            if raw_value.is_empty() {
+                println!("Quality parameter present but empty");
+                return None;
+            }
+
+            match raw_value.parse::<i32>() {
+                Ok(value) if (1..=100).contains(&value) => {
+                    return Some(value as u8);
+                }
+                Ok(_) => {
+                    println!("Ignoring quality value '{}' outside 1-100", raw_value);
+                    return None;
+                }
+                Err(_) => {
+                    println!("Invalid quality value '{}': not an integer", raw_value);
+                    return None;
+                }
+            }
+        }
+
+        None
+    }
+
+    fn env_quality_preset() -> Option<u8> {
+        let raw = env::var("QUALITY_PRESET").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            println!("QUALITY_PRESET is empty");
+            return None;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        let value = match lower.as_str() {
+            "high" => Some(95),
+            "medium" => Some(80),
+            "low" => Some(65),
+            _ => {
+                if let Some(rest) = lower.strip_prefix("custom:") {
+                    match rest.parse::<i32>() {
+                        Ok(num) => Some(num),
+                        Err(_) => {
+                            println!("QUALITY_PRESET custom value '{}' is not an integer", rest);
+                            None
+                        }
+                    }
+                } else {
+                    println!("QUALITY_PRESET value '{}' is not recognized", trimmed);
+                    None
+                }
+            }
+        }?;
+
+        if (1..=100).contains(&value) {
+            Some(value as u8)
+        } else {
+            println!("QUALITY_PRESET value {} out of range 1-100", value);
+            None
+        }
+    }
+
     fn apply_crop(&self, img: DynamicImage, params: CropParams) -> Result<DynamicImage, String> {
         let image_width = img.width();
         let image_height = img.height();
@@ -706,9 +826,15 @@ impl HttpBody {
         }
     }
 
-    fn save_in_original_format(&self, img: &DynamicImage, out: &mut Vec<u8>) -> Result<(), image::ImageError> {
+    fn save_in_original_format(
+        &self,
+        img: &DynamicImage,
+        out: &mut Vec<u8>,
+        quality: Option<u8>,
+    ) -> Result<(), image::ImageError> {
+        use image::codecs::jpeg::JpegEncoder;
         use std::io::Cursor;
-        
+
         // Get the original file extension to determine format
         let format = if let Some(ext_bytes) = self.get_property(vec!["request.extension"]) {
             if let Ok(ext) = from_utf8(&ext_bytes) {
@@ -723,21 +849,23 @@ impl HttpBody {
         } else {
             image::ImageFormat::Jpeg // Default to JPEG
         };
-        
+
         let mut cursor = Cursor::new(out);
-        
+
         match format {
             image::ImageFormat::Jpeg => {
-                img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
+                let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality.unwrap_or(75));
+                encoder.encode_image(img)?;
             }
             image::ImageFormat::Png => {
                 img.write_to(&mut cursor, image::ImageFormat::Png)?;
             }
             _ => {
-                img.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
+                let mut encoder = JpegEncoder::new_with_quality(&mut cursor, quality.unwrap_or(75));
+                encoder.encode_image(img)?;
             }
         }
-        
+
         Ok(())
     }
     
